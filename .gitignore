@@ -1,0 +1,22 @@
+.idea/
+*.iml
+
+# Maven build output
+server/target/
+
+# Node dependencies and build
+client/node_modules/
+client/dist/
+
+# Docker data volumes (database, object storage)
+mysql/data/
+mysql/logs/
+minio/data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
