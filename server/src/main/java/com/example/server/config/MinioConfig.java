@@ -25,12 +25,12 @@ public class MinioConfig {
 
     @Bean
     public MinioClient minioClient() {
-        try {
-            MinioClient client = MinioClient.builder()
-                    .endpoint(endpoint)
-                    .credentials(accessKey, secretKey)
-                    .build();
+        MinioClient client = MinioClient.builder()
+                .endpoint(endpoint)
+                .credentials(accessKey, secretKey)
+                .build();
 
+        try {
             //检查桶是否存在，不存在就创建
             boolean found = client.bucketExists(BucketExistsArgs.builder().bucket(bucketName).build());
             if (!found) {
@@ -66,11 +66,12 @@ public class MinioConfig {
                             .build()
             );
 
-            System.out.println("  MinIO 配置成功，桶权限已强制设置为 Public！");
-            return client;
+            System.out.println("✅ MinIO 配置成功，桶权限已强制设置为 Public！");
 
         } catch (Exception e) {
-            throw new RuntimeException("MinIO 初始化失败", e);
+            System.err.println("⚠️ MinIO 不可用（" + endpoint + "）— 上传功能将在运行时报错: " + e.getMessage());
+            // 仍然返回 client，失败推迟到实际使用时
         }
+        return client;
     }
 }
