@@ -6,6 +6,8 @@ import org.springframework.stereotype.Component;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -18,6 +20,9 @@ public class YtDlpUtils {
 
     @Value("${tool.ffmpeg.dir}")
     private String ffmpegDir;
+
+    @Value("${tool.ytdlp.cookie-file:./cookies.txt}")
+    private String cookieFilePath;
 
     public File downloadVideo(String url) throws Exception {
         String tempDir = System.getProperty("java.io.tmpdir");
@@ -33,15 +38,36 @@ public class YtDlpUtils {
         List<String> command = new ArrayList<>();
         command.add(ytDlpPath);
 
-        // --- 浏览器 Cookie（各平台通用）---
-        String cookiesFromBrowser = findBrowserWithCookies(host);
-        if (cookiesFromBrowser != null) {
-            command.add("--cookies-from-browser");
-            command.add(cookiesFromBrowser);
-            System.out.println("🔐 [yt-dlp] 使用浏览器 Cookie: " + cookiesFromBrowser);
+        // ==========================================
+        // Cookie 策略：cookies.txt 文件优先，浏览器提取作为降级方案
+        // cookies.txt 不受浏览器运行时 Cookie DB 锁定的影响，更稳定
+        // ==========================================
+        Path cookieFile = Path.of(cookieFilePath);
+        if (Files.exists(cookieFile)) {
+            command.add("--cookies");
+            command.add(cookieFilePath);
+            System.out.println("🔐 [yt-dlp] 使用 Cookie 文件: " + cookieFilePath);
+        } else {
+            // 降级：尝试浏览器 Cookie
+            String cookiesFromBrowser = findBrowserWithCookies(host);
+            if (cookiesFromBrowser != null) {
+                command.add("--cookies-from-browser");
+                command.add(cookiesFromBrowser);
+                System.out.println("🔐 [yt-dlp] 使用浏览器 Cookie: " + cookiesFromBrowser);
+            } else {
+                System.out.println("⚠️ [yt-dlp] 未找到 Cookie 文件 (" + cookieFilePath + ") 或浏览器 Cookie，将尝试无 Cookie 下载（大概率失败）");
+                System.out.println("💡 [yt-dlp] 建议: 使用 Chrome 扩展 'Get cookies.txt LOCALLY' 导出 B站 Cookie 为 cookies.txt 放到项目根目录");
+            }
         }
 
-        // 现代浏览器 User-Agent
+        // ==========================================
+        // 浏览器指纹伪装（yt-dlp 2024.11+ 支持）
+        // 完整伪装 TLS 指纹 + HTTP/2 帧大小，比单纯改 UA 强得多
+        // ==========================================
+        command.add("--impersonate");
+        command.add("chrome:windows");
+
+        // 现代浏览器 User-Agent（impersonate 之外的额外保障）
         command.add("--user-agent");
         command.add("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
 
@@ -60,6 +86,26 @@ public class YtDlpUtils {
             command.add("--extractor-args");
             command.add("bilibili:player=html5;skip=hls,dash");
         }
+
+        // ==========================================
+        // 速率限制（避免触发 B站 频率限制）
+        // ==========================================
+        command.add("--sleep-requests");
+        command.add("3");
+        command.add("--sleep-interval");
+        command.add("5");
+        command.add("--max-sleep-interval");
+        command.add("15");
+
+        // ==========================================
+        // 增强重试（B站反爬常需多次重试）
+        // ==========================================
+        command.add("--retries");
+        command.add("5");
+        command.add("--fragment-retries");
+        command.add("10");
+        command.add("--extractor-retries");
+        command.add("5");
 
         command.add("--ffmpeg-location");
         command.add(ffmpegDir);
@@ -86,7 +132,8 @@ public class YtDlpUtils {
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.contains("ERROR") || line.contains("Downloading") || line.contains("[Merger]")
-                        || line.contains("Extracting") || line.contains("412")) {
+                        || line.contains("Extracting") || line.contains("412") || line.contains("403")
+                        || line.contains("WARNING") || line.contains("[download]")) {
                     System.out.println("cmd > " + line);
                 }
                 logs.append(line).append("\n");
@@ -97,36 +144,63 @@ public class YtDlpUtils {
         if (exitCode != 0) {
             String errorMsg = logs.toString();
 
-            // 412 专用提示
-            if (errorMsg.contains("412") || errorMsg.contains("Precondition Failed")) {
-                String hint = "";
-                if (cookiesFromBrowser == null) {
-                    hint = "\n\n💡 提示: " + host + " 需要登录凭证。请在 Chrome/Edge 浏览器中登录后重试。";
-                } else {
-                    hint = "\n\n💡 提示: Cookie 可能已过期，请在浏览器中重新登录 " + host + " 后重试。";
+            // ==========================================
+            // B站 专属错误诊断
+            // ==========================================
+            if (host.contains("bilibili")) {
+                // 412 — WBI 签名或 Cookie 问题
+                if (errorMsg.contains("412") || errorMsg.contains("Precondition Failed")) {
+                    String hint = "\n\n💡 B站诊断: HTTP 412 — WBI 签名验证失败或 Cookie 无效。\n"
+                            + "   常见原因及解决方案:\n"
+                            + "   1) Cookie 过期或无效 → 重新导出 cookies.txt (Chrome 扩展: Get cookies.txt LOCALLY)\n"
+                            + "   2) 短时间内请求过多 → 等待 5-10 分钟后重试\n"
+                            + "   3) yt-dlp 版本过旧 → 升级 yt-dlp (当前要求 ≥ 2024.11)\n"
+                            + "   当前 Cookie 状态: " + (Files.exists(Path.of(cookieFilePath)) ? "cookies.txt 文件存在" : "cookies.txt 文件不存在，且" + (findBrowserWithCookies(host) == null ? "未找到可用浏览器" : "使用浏览器 Cookie")) + "\n";
+                    throw new RuntimeException("B站反爬拦截 (HTTP 412) — WBI 签名/Cookie 验证失败。" + hint);
                 }
-                throw new RuntimeException("平台反爬拦截 (HTTP 412)，需要浏览器登录凭证。" + hint);
+
+                // 403 — 访问被拒
+                if (errorMsg.contains("403") || errorMsg.contains("Forbidden")) {
+                    String hint = "\n\n💡 B站诊断: HTTP 403 — 访问被拒。\n"
+                            + "   常见原因:\n"
+                            + "   1) Cookie 失效 → 重新导出 cookies.txt\n"
+                            + "   2) 地区限制 → 该视频仅限中国大陆观看，可能需要代理\n"
+                            + "   3) IP 被临时封禁 → 等待 10-30 分钟后重试\n"
+                            + "   4) 浏览器指纹不匹配 → 已启用 --impersonate chrome:windows 伪装\n"
+                            + "   当前 Cookie 状态: " + (Files.exists(Path.of(cookieFilePath)) ? "cookies.txt 文件存在" : "cookies.txt 文件不存在") + "\n";
+                    throw new RuntimeException("B站反爬拦截 (HTTP 403) — 访问被拒。" + hint);
+                }
+
+                // Cookie 缺失
+                if (errorMsg.contains("cookies are needed") || errorMsg.contains("Fresh cookies")) {
+                    String hint = "\n\n💡 B站诊断: 需要有效 Cookie。\n"
+                            + "   解决方案:\n"
+                            + "   1) 在 Chrome 安装扩展 'Get cookies.txt LOCALLY'\n"
+                            + "   2) 访问 bilibili.com 并登录账号\n"
+                            + "   3) 点击扩展图标 → Export → 保存为 cookies.txt\n"
+                            + "   4) 将 cookies.txt 放到项目根目录 (" + Path.of(cookieFilePath).toAbsolutePath().getParent() + ")\n"
+                            + "   5) 重启后端服务后重试\n"
+                            + "   当前 Cookie 状态: " + (Files.exists(Path.of(cookieFilePath)) ? "cookies.txt 文件存在" : "cookies.txt 文件不存在") + "\n";
+                    throw new RuntimeException("B站要求登录凭证 (Cookie)。" + hint);
+                }
             }
 
-            // 403 反爬拦截（B站 WBI 签名失败等）
+            // ==========================================
+            // 通用错误处理（非 B站平台）
+            // ==========================================
+            if (errorMsg.contains("412") || errorMsg.contains("Precondition Failed")) {
+                String hint = "\n\n💡 提示: " + host + " 需要登录凭证。请确保 cookies.txt 文件存在或浏览器已登录 " + host + "。";
+                throw new RuntimeException("平台反爬拦截 (HTTP 412)，需要登录凭证。" + hint);
+            }
+
             if (errorMsg.contains("403") || errorMsg.contains("Forbidden")) {
-                String hint = "";
-                if (cookiesFromBrowser == null) {
-                    hint = "\n\n💡 提示: " + host + " 反爬拦截 (403)。请先关闭 Chrome/Edge 浏览器（否则 Cookie 数据库被锁定），然后重启服务重试。如果仍然失败，请在浏览器中登录 " + host + " 后再次关闭浏览器重试。";
-                } else {
-                    hint = "\n\n💡 提示: " + host + " 反爬拦截 (403)。Cookie 可能已过期，请在 " + cookiesFromBrowser + " 浏览器中重新登录 " + host + "，然后关闭浏览器后重试。";
-                }
+                String hint = "\n\n💡 提示: " + host + " 反爬拦截 (403)。"
+                        + "\n   建议: 1) 导出 cookies.txt 文件  2) 检查 Cookie 是否过期  3) 等待后重试";
                 throw new RuntimeException("平台反爬拦截 (HTTP 403) —— " + host + " 拒绝了请求。" + hint);
             }
 
-            // Cookie 需求提示（各平台通用）
             if (errorMsg.contains("cookies are needed") || errorMsg.contains("Fresh cookies")) {
-                String hint = "";
-                if (cookiesFromBrowser == null) {
-                    hint = "\n\n💡 提示: " + host + " 需要浏览器 Cookie。请先关闭 Chrome/Edge 浏览器（解锁 Cookie 数据库），重启服务后重试。如果仍不行，请在浏览器中登录 " + host + " 后关闭浏览器再试。";
-                } else {
-                    hint = "\n\n💡 提示: Cookie 可能已过期或未登录。请在 " + cookiesFromBrowser + " 浏览器中访问并登录 " + host + "，然后关闭浏览器后重试。";
-                }
+                String hint = "\n\n💡 提示: " + host + " 需要 Cookie。请导出 cookies.txt 放到项目根目录。";
                 throw new RuntimeException("平台要求浏览器 Cookie 验证。" + hint);
             }
 
@@ -183,7 +257,7 @@ public class YtDlpUtils {
                 System.out.println("⚠️ [yt-dlp] 浏览器 " + browser + " 不可用: " + e.getMessage());
             }
         }
-        System.out.println("❌ [yt-dlp] 未找到可用浏览器 Cookie（请关闭 Chrome 等浏览器后重试，否则 Cookie 数据库被锁定）");
+        System.out.println("❌ [yt-dlp] 未找到可用浏览器 Cookie（请关闭 Chrome 等浏览器后重试，或使用 cookies.txt 文件）");
         return null;
     }
 

@@ -20,3 +20,6 @@ Thumbs.db
 # Environment files
 .env
 .env.local
+
+# yt-dlp Cookie export file (contains sensitive session tokens)
+cookies.txt
