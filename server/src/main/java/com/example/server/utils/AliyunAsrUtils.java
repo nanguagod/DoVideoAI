@@ -2,6 +2,9 @@ package com.example.server.utils;
 
 import com.alibaba.dashscope.audio.asr.recognition.Recognition;
 import com.alibaba.dashscope.audio.asr.recognition.RecognitionParam;
+import com.alibaba.fastjson2.JSON;
+import com.alibaba.fastjson2.JSONArray;
+import com.alibaba.fastjson2.JSONObject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -54,11 +57,15 @@ public class AliyunAsrUtils {
                     .build();
 
             Recognition recognizer = new Recognition();
-            String text = recognizer.call(param, new File(pcmPath));
+            String rawJson = recognizer.call(param, new File(pcmPath));
 
-            if (text != null && !text.isBlank()) {
-                System.out.println("✅ [通义听悟] 识别完成: " + text.length() + " 字");
-                return text;
+            if (rawJson != null && !rawJson.isBlank()) {
+                // 解析 JSON，提取每句的 text 字段拼接成纯文本
+                String text = extractTextFromResult(rawJson);
+                if (text != null && !text.isBlank()) {
+                    System.out.println("✅ [通义听悟] 识别完成: " + text.length() + " 字");
+                    return text;
+                }
             }
             return "（未识别到语音内容）";
 
@@ -73,6 +80,42 @@ public class AliyunAsrUtils {
                     Files.deleteIfExists(Path.of(pcmPath));
                 } catch (Exception ignored) {}
             }
+        }
+    }
+
+    /**
+     * 从通义听悟 API 返回的 JSON 中提取纯文本
+     * JSON 格式: {"sentences":[{"text":"...","begin_time":0,...}, ...]}
+     */
+    private String extractTextFromResult(String rawJson) {
+        try {
+            JSONObject root = JSON.parseObject(rawJson);
+            if (root == null) return rawJson;
+
+            // 尝试从 sentences 数组提取
+            JSONArray sentences = root.getJSONArray("sentences");
+            if (sentences != null && !sentences.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < sentences.size(); i++) {
+                    JSONObject sentence = sentences.getJSONObject(i);
+                    String text = sentence.getString("text");
+                    if (text != null && !text.isBlank()) {
+                        if (sb.length() > 0) sb.append("\n");
+                        sb.append(text);
+                    }
+                }
+                return sb.toString();
+            }
+
+            // 降级：尝试单句 text 字段
+            String text = root.getString("text");
+            if (text != null && !text.isBlank()) return text;
+
+            // 实在解析不了，返回原始内容
+            return rawJson;
+        } catch (Exception e) {
+            System.err.println("⚠️ [通义听悟] JSON 解析失败，返回原始内容: " + e.getMessage());
+            return rawJson;
         }
     }
 
